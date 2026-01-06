@@ -8,9 +8,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import io
 
-# --- Helper Functions ---
+# --- Logic Functions ---
 
 def split_text(text):
+    """Splits text into English and Arabic parts."""
     if not text: return "", ""
     text = str(text).strip()
     en, ar = "", ""
@@ -27,6 +28,7 @@ def split_text(text):
     return en, ar
 
 def process_translation(en_val, ar_val):
+    """Translates missing fields and flags for highlighting."""
     enh, arh = False, False
     if ar_val and not en_val:
         try:
@@ -41,103 +43,84 @@ def process_translation(en_val, ar_val):
     return en_val, ar_val, enh, arh
 
 def fetch_via_graphql(url):
-    """
-    Extracts Place ID from URL and performs a real GraphQL call to Fresha.
-    """
-    # 1. Extract pId from URL
-    match = re.search(r'pId=(\d+)', url)
-    if not match:
-        return None, "Could not find Place ID (pId) in the URL. Please copy the full booking URL."
+    """Extracts slug and calls Fresha GraphQL using the CURL-provided hash."""
+    # Extract location slug (the part after /a/)
+    slug_match = re.search(r'/a/([^/?#]+)', url)
+    if not slug_match:
+        return None, "Invalid URL. Please ensure it is a Fresha salon link (contains /a/salon-name)."
     
-    place_id = match.group(1)
+    location_slug = slug_match.group(1)
     graphql_url = "https://www.fresha.com/graphql"
-    
-    # 2. Mimic the Fresha GraphQL Request
+
     payload = {
-        "operationName": "BookingFlowInitialize",
         "variables": {
             "input": {
-                "placeId": place_id,
-                "clientContext": {"source": "MARKETPLACE_DESKTOP"}
+                "locationSlug": location_slug,
+                "capabilities": ["CART_ID", "SERVICE_ADDONS"]
             }
         },
-        "query": """
-        query BookingFlowInitialize($input: BookingFlowInitializeInput!) {
-          bookingFlowInitialize(input: $input) {
-            layout { cart { name address avatarUrl } }
-            screenServices {
-              categories {
-                name
-                description
-                items {
-                  name
-                  description
-                  caption
-                  price { formatted }
-                }
-              }
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": "470f916eb8fb50235508f74481a13b68810ba805226c1546039b8ed6ee19c39d"
             }
-          }
-        }"""
+        }
     }
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
         'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'x-client-platform': 'web'
     }
 
     try:
-        response = requests.post(graphql_url, json=payload, headers=headers)
-        if response.status_code != 200:
-            return None, f"GraphQL Request Failed: {response.status_code}"
+        response = requests.post(graphql_url, json=payload, headers=headers, timeout=20)
+        res_data = response.json()
         
-        res_json = response.json()
-        if 'data' in res_json and 'bookingFlowInitialize' in res_json['data']:
-            return res_json['data']['bookingFlowInitialize'], None
-        else:
-            return None, "Invalid data returned from Fresha API."
+        if 'data' in res_data and 'bookingFlowInitialize' in res_data['data']:
+            return res_data['data']['bookingFlowInitialize'], None
+        elif 'errors' in res_data:
+            return None, f"Fresha API Error: {res_data['errors'][0].get('message')}"
+        return None, "Data structure not found in response."
     except Exception as e:
-        return None, f"Network Error: {str(e)}"
+        return None, f"Request failed: {str(e)}"
 
 # --- Streamlit UI ---
 
-st.set_page_config(page_title="Fresha Direct Exporter", page_icon="📝")
-st.title("Fresha Salon Exporter")
+st.set_page_config(page_title="Fresha Salon Exporter", page_icon="📝")
+st.title("Fresha Salon to Excel")
+st.write("Automatically extract, translate, and highlight salon menus.")
 
-tab1, tab2 = st.tabs(["Scan via Booking URL", "Upload JSON"])
+tab1, tab2 = st.tabs(["Link Scraper", "JSON Upload"])
 booking_data = None
 
 with tab1:
-    st.write("Paste the URL you see when clicking 'Book Now' or 'All Services'")
-    url_input = st.text_input("Fresha Booking URL:", placeholder="https://www.fresha.com/a/.../booking?pId=12345")
+    url_input = st.text_input("Paste Fresha URL:", placeholder="https://www.fresha.com/a/rosoleen-beauty-spa...")
     if url_input:
-        with st.spinner("Calling Fresha GraphQL API..."):
+        with st.spinner("Fetching salon menu..."):
             res_data, err = fetch_via_graphql(url_input)
-            if err:
-                st.error(err)
+            if err: st.error(err)
             else:
                 booking_data = res_data
-                st.success("Salon data fetched via GraphQL!")
+                st.success("Salon data retrieved!")
 
 with tab2:
     uploaded_file = st.file_uploader("Upload fresha.json", type="json")
     if uploaded_file:
         file_json = json.load(uploaded_file)
-        # Unwrap data if it's a full raw response
         booking_data = file_json.get('data', {}).get('bookingFlowInitialize', file_json)
 
-# --- Processing & Excel Download ---
+# --- Common Processing ---
 
 if booking_data and 'layout' in booking_data:
-    if st.button("Build & Download Excel"):
-        with st.spinner("Translating and formatting..."):
+    if st.button("Generate & Download Excel"):
+        with st.spinner("Translating missing values..."):
             try:
                 cart = booking_data['layout']['cart']
                 full_name = cart.get('name', 'Salon')
                 name_en, _ = split_text(full_name)
-                
                 clean_name = "".join(c for c in name_en if c.isalnum() or c.isspace()).strip()
-                excel_filename = f"{clean_name}.xlsx" if clean_name else "Salon_Menu.xlsx"
+                excel_filename = f"{clean_name}.xlsx" if clean_name else "Salon_Export.xlsx"
 
                 df_info = pd.DataFrame([
                     {"Field": "Salon Name", "Value": full_name},
@@ -183,7 +166,7 @@ if booking_data and 'layout' in booking_data:
                 
                 final_output = io.BytesIO()
                 wb.save(final_output)
-                
                 st.download_button(label="📥 Download Excel", data=final_output.getvalue(), file_name=excel_filename)
+                
             except Exception as e:
                 st.error(f"Error: {e}")
