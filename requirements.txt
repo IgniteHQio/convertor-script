@@ -2,3 +2,5 @@ streamlit
 pandas
 openpyxl
 deep-translator
+requests
+beautifulsoup4
