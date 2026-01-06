@@ -43,18 +43,20 @@ def split_text(text):
     return en, ar
 
 def process_translation(en_val, ar_val):
-    enh, arh = False, False
+    """Translates missing side and returns (en, ar, was_en_translated, was_ar_translated)"""
+    translated_en = False
+    translated_ar = False
     if ar_val and not en_val:
         try:
             en_val = GoogleTranslator(source='ar', target='en').translate(ar_val)
-            enh = True
+            translated_en = True
         except: pass
     elif en_val and not ar_val:
         try:
             ar_val = GoogleTranslator(source='en', target='ar').translate(en_val)
-            arh = True
+            translated_ar = True
         except: pass
-    return en_val, ar_val, enh, arh
+    return en_val, ar_val, translated_en, translated_ar
 
 def fetch_salon_json(salon_url):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -66,46 +68,24 @@ def fetch_salon_json(salon_url):
         soup = BeautifulSoup(base_res.text, 'html.parser')
         next_data_script = soup.find('script', id='__NEXT_DATA__')
         build_id = json.loads(next_data_script.string).get('buildId')
-        
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
         json_res = requests.get(json_url, headers=headers, timeout=10)
         return json_res.json(), None
     except Exception as e:
         return None, str(e)
 
-def find_menu_and_name(obj):
-    """Recursively hunts for 'services' or 'categories' and salon name."""
-    found_menu = None
-    found_name = "Salon_Export"
-    
-    def walk(item):
-        nonlocal found_menu, found_name
-        if isinstance(item, dict):
-            # Capture a likely salon name if not set
-            if 'name' in item and found_name == "Salon_Export":
-                if isinstance(item['name'], str) and 5 < len(item['name']) < 100:
-                    found_name = item['name']
-            
-            # Check for keys that typically hold service lists
-            for key in ['services', 'categories', 'screenServices']:
-                if key in item and isinstance(item[key], list) and len(item[key]) > 0:
-                    # Check if the list contains objects with an 'items' list inside
-                    if isinstance(item[key][0], dict) and 'items' in item[key][0]:
-                        found_menu = item[key]
-                        return
-            
-            for v in item.values():
-                if found_menu: return
-                walk(v)
-        elif isinstance(item, list):
-            for i in item:
-                if found_menu: return
-                walk(i)
+def find_key_recursive(data, key_name):
+    if isinstance(data, dict):
+        if key_name in data: return data[key_name]
+        for v in data.values():
+            res = find_key_recursive(v, key_name)
+            if res: return res
+    elif isinstance(data, list):
+        for i in data:
+            res = find_key_recursive(i, key_name)
+            if res: return res
+    return None
 
-    walk(obj)
-    return found_menu, found_name
-
-# --- Main App ---
 if check_password():
     st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
     st.title("✂️ SALON JSON to EXCEL")
@@ -116,14 +96,13 @@ if check_password():
     tab1, tab2 = st.tabs(["🔗 Scan URL", "📄 Paste JSON"])
 
     with tab1:
-        url_input = st.text_input("Paste Fresha URL:", key="url_box")
+        url_input = st.text_input("Paste Fresha URL:")
         if st.button("Fetch Data"):
-            with st.spinner("Connecting to Fresha..."):
-                data, err = fetch_salon_json(url_input)
-                if err: st.error(f"Error: {err}")
-                else: 
-                    st.session_state["raw_data"] = data
-                    st.success("✅ JSON data successfully retrieved!")
+            data, err = fetch_salon_json(url_input)
+            if err: st.error(err)
+            else: 
+                st.session_state["raw_data"] = data
+                st.success("✅ Data Retrieved!")
 
     with tab2:
         json_text = st.text_area("Paste JSON content:", height=200)
@@ -131,88 +110,87 @@ if check_password():
             try: 
                 st.session_state["raw_data"] = json.loads(json_text)
                 st.success("✅ JSON Loaded!")
-            except: st.error("Invalid JSON format.")
+            except: st.error("Invalid JSON")
 
-    # --- Processing logic ---
     if st.session_state["raw_data"]:
         data = st.session_state["raw_data"]
-        menu_data, salon_name = find_menu_and_name(data)
-
+        
+        # 1. INFO DATA EXTRACTION
+        loc_info = find_key_recursive(data, 'location') or {}
+        info_rows = [
+            {"Field": "Name", "Value": loc_info.get('name')},
+            {"Field": "Description", "Value": loc_info.get('description')},
+            {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
+            {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
+        ]
+        
+        # 2. MENU DATA EXTRACTION
+        menu_data = find_key_recursive(data, 'services') or find_key_recursive(data, 'categories')
+        
         if menu_data:
-            st.info(f"📍 Salon: **{salon_name}** | Found **{len(menu_data)}** service groups.")
+            st.info(f"Salon: **{loc_info.get('name', 'Unknown')}** | Groups: {len(menu_data)}")
             
-            if st.button("🚀 Start Translation & Generate Excel"):
-                items_list, highlights = [], []
+            if st.button("🚀 Generate Excel"):
+                items_list, cell_highlights = [], []
                 
-                # Flatten the list for the progress bar
+                # Flatten items
                 all_items = []
                 for group in menu_data:
-                    group_name = group.get('name', 'General')
                     for item in group.get('items', []):
-                        all_items.append((group_name, item))
+                        all_items.append((group.get('name', ''), item))
                 
-                total_items = len(all_items)
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                for idx, (group_name, item) in enumerate(all_items):
-                    # Update progress
-                    progress_bar.progress((idx + 1) / total_items)
-                    status_text.text(f"Processing {idx+1} of {total_items} items...")
-
-                    # 1. Category
-                    c_en, c_ar, ceh, cah = process_translation(*split_text(group_name))
+                prog = st.progress(0)
+                for idx, (g_name, item) in enumerate(all_items):
+                    prog.progress((idx + 1) / len(all_items))
                     
-                    # 2. Item details
-                    i_name = item.get('name', '')
-                    i_desc = item.get('description') or item.get('caption') or ""
+                    # Category
+                    c_en, c_ar, c_en_t, c_ar_t = process_translation(*split_text(g_name))
+                    # Item Name
+                    i_en, i_ar, i_en_t, i_ar_t = process_translation(*split_text(item.get('name', '')))
+                    # Item Desc
+                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or item.get('caption') or ""))
                     
-                    # Handle multiple price formats found in different Fresha JSON versions
-                    price = (item.get('formattedRetailPrice') or 
-                             item.get('price', {}).get('formatted') or 
-                             item.get('retailPrice', {}).get('value', ""))
+                    price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
                     
-                    i_en, i_ar, ieh, iah = process_translation(*split_text(i_name))
-                    id_en, id_ar, ideh, idah = process_translation(*split_text(i_desc))
+                    # Track which columns to highlight (1-based index)
+                    row_num = len(items_list) + 2
+                    highlights = []
+                    if c_en_t: highlights.append(1)
+                    if c_ar_t: highlights.append(2)
+                    if i_en_t: highlights.append(3)
+                    if i_ar_t: highlights.append(4)
+                    if d_en_t: highlights.append(5)
+                    if d_ar_t: highlights.append(6)
                     
-                    row_idx = len(items_list) + 2
-                    if any([ceh, cah, ieh, iah, ideh, idah]):
-                        highlights.append((row_idx, [1, 2, 3, 4, 5, 6]))
+                    if highlights:
+                        cell_highlights.append((row_num, highlights))
 
                     items_list.append({
                         "Category (EN)": c_en, "Category (AR)": c_ar,
                         "Service (EN)": i_en, "Service (AR)": i_ar,
-                        "Desc (EN)": id_en, "Desc (AR)": id_ar,
+                        "Desc (EN)": d_en, "Desc (AR)": d_ar,
                         "Price": price
                     })
 
-                # Create Excel file in memory
+                # Write Excel
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    pd.DataFrame(items_list).to_excel(writer, sheet_name='MENU', index=False)
+                    pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
+                    pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
                 
                 output.seek(0)
                 wb = load_workbook(output)
-                ws = wb['MENU']
+                ws = wb['ITEMS']
                 yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-                for r, cs in highlights:
-                    for c in cs: ws.cell(row=r, column=c).fill = yellow
                 
-                final_output = io.BytesIO()
-                wb.save(final_output)
+                # Apply highlight to SPECIFIC cells only
+                for r_idx, cols in cell_highlights:
+                    for c_idx in cols:
+                        ws.cell(row=r_idx, column=c_idx).fill = yellow
                 
-                st.success("✨ Processing Complete!")
-                st.download_button(
-                    label="📥 Download Excel File", 
-                    data=final_output.getvalue(), 
-                    file_name=f"{salon_name.replace(' ', '_')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                final_out = io.BytesIO()
+                wb.save(final_out)
+                st.success("✅ Ready!")
+                st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
         else:
-            st.error("❌ Structure not recognized. Could not find 'services' or 'categories' keys.")
-            with st.expander("View Debug JSON"):
-                st.json(data)
-
-    if st.button("🧹 Reset App"):
-        st.session_state["raw_data"] = None
-        st.rerun()
+            st.error("No service menu found in JSON.")
