@@ -56,6 +56,20 @@ def process_translation(en_val, ar_val):
         except: pass
     return en_val, ar_val, enh, arh
 
+def find_key_recursive(data, key_names):
+    """Deep search for specific keys (list of names) in messy JSON structures."""
+    if isinstance(data, dict):
+        for kn in key_names:
+            if kn in data: return data[kn]
+        for v in data.values():
+            res = find_key_recursive(v, key_names)
+            if res: return res
+    elif isinstance(data, list):
+        for i in data:
+            res = find_key_recursive(i, key_names)
+            if res: return res
+    return None
+
 def fetch_salon_json(salon_url):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     try:
@@ -65,27 +79,16 @@ def fetch_salon_json(salon_url):
         base_res = requests.get(salon_url, headers=headers, timeout=10)
         soup = BeautifulSoup(base_res.text, 'html.parser')
         next_data_script = soup.find('script', id='__NEXT_DATA__')
-        if not next_data_script: return None, "Failed to find Build ID. Fresha might be blocking automated requests."
+        if not next_data_script: return None, "Failed to find Build ID."
         build_id = json.loads(next_data_script.string).get('buildId')
+        
+        # Use handle.json as requested
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        st.info(f"Found Build ID: {build_id}. Fetching JSON...")
+        st.info(f"Fetching from: {json_url}")
         json_res = requests.get(json_url, headers=headers, timeout=10)
         return json_res.json(), None
     except Exception as e:
         return None, str(e)
-
-def find_key_recursive(data, key_name):
-    """Deep search for specific keys in messy JSON structures."""
-    if isinstance(data, dict):
-        if key_name in data: return data[key_name]
-        for v in data.values():
-            res = find_key_recursive(v, key_name)
-            if res: return res
-    elif isinstance(data, list):
-        for i in data:
-            res = find_key_recursive(i, key_name)
-            if res: return res
-    return None
 
 # --- Main App ---
 
@@ -97,62 +100,74 @@ if check_password():
     raw_json_input = None
 
     with tab1:
-        url_input = st.text_input("Paste Fresha Salon URL:", placeholder="https://www.fresha.com/a/rosoleen-beauty-spa...")
+        url_input = st.text_input("Paste Fresha Salon URL:")
         if st.button("Fetch & Process URL"):
-            with st.spinner("Analyzing Fresha structure..."):
-                raw_json_input, err = fetch_salon_json(url_input)
-                if err: st.error(err)
+            raw_json_input, err = fetch_salon_json(url_input)
+            if err: st.error(err)
 
     with tab2:
-        json_text = st.text_area("Paste the JSON content here:", height=300)
+        json_text = st.text_area("Paste JSON here:", height=200)
         if json_text:
             try: raw_json_input = json.loads(json_text)
-            except: st.error("❌ Invalid JSON format.")
+            except: st.error("❌ Invalid JSON.")
 
     with tab3:
-        uploaded_file = st.file_uploader("Upload JSON file", type=["json"])
+        uploaded_file = st.file_uploader("Upload JSON", type=["json"])
         if uploaded_file: raw_json_input = json.load(uploaded_file)
 
     if raw_json_input:
-        # Search for categories and salon name anywhere in the file
-        categories = find_key_recursive(raw_json_input, 'categories')
-        location_info = find_key_recursive(raw_json_input, 'location')
+        # Search for categories OR services
+        menu_data = find_key_recursive(raw_json_input, ['services', 'categories', 'screenServices'])
+        location_info = find_key_recursive(raw_json_input, ['location'])
         salon_name = location_info.get('name', 'Salon_Export') if location_info else "Salon_Export"
 
-        if categories and isinstance(categories, list):
-            st.success(f"✅ Found {len(categories)} categories for '{salon_name}'")
+        if menu_data and isinstance(menu_data, (list, dict)):
+            # If we found screenServices, it's a dict containing categories
+            if isinstance(menu_data, dict) and 'categories' in menu_data:
+                menu_data = menu_data['categories']
+            
+            st.success(f"✅ Found {len(menu_data)} service groups for '{salon_name}'")
+            
             if st.button("🚀 Generate Excel"):
-                with st.spinner("Processing..."):
-                    items_list, highlights = [], []
-                    for cat in categories:
-                        c_en, c_ar, ceh, cah = process_translation(*split_text(cat.get('name', '')))
-                        for item in cat.get('items', []):
-                            i_en, i_ar, ieh, iah = process_translation(*split_text(item.get('name', '')))
-                            id_en, id_ar, ideh, idah = process_translation(*split_text(item.get('description', '')))
-                            
-                            row_idx = len(items_list) + 2
-                            if any([ceh, cah, ieh, iah, ideh, idah]):
-                                highlights.append((row_idx, [1, 2, 3, 4, 5, 6]))
-
-                            items_list.append({
-                                "Category (EN)": c_en, "Category (AR)": c_ar,
-                                "Service (EN)": i_en, "Service (AR)": i_ar,
-                                "Desc (EN)": id_en, "Desc (AR)": id_ar,
-                                "Price": item.get('price', {}).get('formatted', '')
-                            })
-
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
-                    output.seek(0)
-                    wb = load_workbook(output)
-                    ws = wb['ITEMS']
-                    yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-                    for r, cs in highlights:
-                        for c in cs: ws.cell(row=r, column=c).fill = yellow
+                items_list, highlights = [], []
+                for group in menu_data:
+                    g_name = group.get('name', 'General')
+                    c_en, c_ar, ceh, cah = process_translation(*split_text(g_name))
                     
-                    final_output = io.BytesIO()
-                    wb.save(final_output)
-                    st.download_button("📥 Download Excel", data=final_output.getvalue(), file_name=f"{salon_name}.xlsx")
+                    for item in group.get('items', []):
+                        i_name = item.get('name', '')
+                        # Handle either 'description' or 'caption'
+                        i_desc = item.get('description') or item.get('caption') or ""
+                        
+                        i_en, i_ar, ieh, iah = process_translation(*split_text(i_name))
+                        id_en, id_ar, ideh, idah = process_translation(*split_text(i_desc))
+                        
+                        # Handle price objects
+                        price_val = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', "")
+                        
+                        row_idx = len(items_list) + 2
+                        if any([ceh, cah, ieh, iah, ideh, idah]):
+                            highlights.append((row_idx, [1, 2, 3, 4, 5, 6]))
+
+                        items_list.append({
+                            "Category (EN)": c_en, "Category (AR)": c_ar,
+                            "Service (EN)": i_en, "Service (AR)": i_ar,
+                            "Desc (EN)": id_en, "Desc (AR)": id_ar,
+                            "Price": price_val
+                        })
+
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
+                output.seek(0)
+                wb = load_workbook(output)
+                ws = wb['ITEMS']
+                yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+                for r, cs in highlights:
+                    for c in cs: ws.cell(row=r, column=c).fill = yellow
+                
+                final_output = io.BytesIO()
+                wb.save(final_output)
+                st.download_button("📥 Download Excel", data=final_output.getvalue(), file_name=f"{salon_name}.xlsx")
         else:
-            st.error("❌ Could not find categories. Ensure the URL/JSON contains the menu items.")
+            st.error("❌ Data structure unrecognized. Please paste the JSON manually in Tab 2 to verify.")
