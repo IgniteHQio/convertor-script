@@ -2,6 +2,8 @@ import streamlit as st
 import json
 import re
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -10,15 +12,10 @@ import io
 # --- Configuration ---
 APP_PASSWORD = "Abcd@1234"
 
-# --- Helper Functions ---
-
 def check_password():
-    """Returns True if the user had the correct password."""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
-
-    if st.session_state["password_correct"]:
-        return True
+    if st.session_state["password_correct"]: return True
 
     st.title("🔒 Access Restricted")
     password_input = st.text_input("Enter App Password", type="password")
@@ -60,104 +57,112 @@ def process_translation(en_val, ar_val):
         except: pass
     return en_val, ar_val, enh, arh
 
+def fetch_salon_json(salon_url):
+    """Automatically extracts handle, finds current Build ID, and fetches JSON."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    
+    try:
+        # 1. Extract Handle from URL
+        match = re.search(r'/a/([^/?#]+)', salon_url)
+        if not match: return None, "Could not find salon handle in URL."
+        handle = match.group(1)
+
+        # 2. Get the HTML of the page to find the current Build ID
+        base_res = requests.get(salon_url, headers=headers, timeout=10)
+        soup = BeautifulSoup(base_res.text, 'html.parser')
+        next_data_script = soup.find('script', id='__NEXT_DATA__')
+        
+        if not next_data_script:
+            return None, "Failed to find Build ID. Fresha might be blocking the request."
+        
+        build_id = json.loads(next_data_script.string).get('buildId')
+        
+        # 3. Construct and Fetch the secret JSON URL
+        json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
+        st.info(f"Fetching data from: {json_url}")
+        
+        json_res = requests.get(json_url, headers=headers, timeout=10)
+        return json_res.json(), None
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
 # --- Main App ---
 
 if check_password():
     st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
     st.title("✂️ SALON JSON to EXCEL")
-    st.markdown("Convert Fresha JSON data into translated, formatted Excel files.")
 
-    tab1, tab2 = st.tabs(["📄 Paste JSON Text", "📁 Upload JSON File"])
+    tab1, tab2, tab3 = st.tabs(["🔗 Scan via URL", "📄 Paste JSON Text", "📁 Upload JSON File"])
     raw_json_input = None
 
     with tab1:
-        json_text = st.text_area("Paste the JSON code here:", height=300, placeholder='{"data": {"bookingFlowInitialize": ...}}')
-        if json_text:
-            try:
-                raw_json_input = json.loads(json_text)
-                st.success("JSON Code Validated!")
-            except json.JSONDecodeError:
-                st.error("❌ Invalid JSON format. Please make sure you copied the full code.")
+        url_input = st.text_input("Paste Fresha Salon URL:", placeholder="https://www.fresha.com/a/rosoleen-beauty-spa...")
+        if st.button("Fetch Salon Data"):
+            with st.spinner("Finding latest Build ID and fetching JSON..."):
+                raw_json_input, err = fetch_salon_json(url_input)
+                if err: st.error(err)
+                else: st.success("Data loaded from Next.js backend!")
 
     with tab2:
-        uploaded_file = st.file_uploader("Upload your fresha.json file", type=["json"])
-        if uploaded_file:
-            raw_json_input = json.load(uploaded_file)
-            st.success("File Uploaded Successfully!")
+        json_text = st.text_area("Paste the __NEXT_DATA__ JSON here:", height=200)
+        if json_text:
+            try: raw_json_input = json.loads(json_text)
+            except: st.error("❌ Invalid JSON.")
 
-    # --- Processing Logic ---
+    with tab3:
+        uploaded_file = st.file_uploader("Upload fresha.json", type=["json"])
+        if uploaded_file: raw_json_input = json.load(uploaded_file)
 
     if raw_json_input:
-        # Standardize the data path
-        booking_data = raw_json_input.get('data', {}).get('bookingFlowInitialize', raw_json_input)
+        # Standardize data path for both Next.js JSON and __NEXT_DATA__ formats
+        props = raw_json_input.get('pageProps', raw_json_input.get('props', {}).get('pageProps', {}))
+        init_data = props.get('initialData', {})
         
-        if 'layout' in booking_data:
-            if st.button("🚀 Generate & Download Excel"):
-                with st.spinner("Processing translations and creating file..."):
-                    try:
-                        cart = booking_data['layout']['cart']
-                        full_name = cart.get('name', 'Salon')
-                        
-                        # Filename logic
-                        name_en, _ = split_text(full_name)
-                        clean_name = "".join(c for c in name_en if c.isalnum() or c.isspace()).strip()
-                        excel_filename = f"{clean_name}.xlsx" if clean_name else "Salon_Export.xlsx"
-
-                        # 1. INFO Sheet
-                        df_info = pd.DataFrame([
-                            {"Field": "Salon Name", "Value": full_name},
-                            {"Field": "Address", "Value": cart.get('address')},
-                            {"Field": "Avatar URL", "Value": cart.get('avatarUrl')}
-                        ])
-
-                        # 2. ITEMS Sheet
-                        items_list, highlights = [], []
-                        categories = booking_data['screenServices']['categories']
-
-                        for cat in categories:
-                            c_en, c_ar, ceh, cah = process_translation(*split_text(cat.get('name', '')))
-                            cd_en, cd_ar, cdeh, cdah = process_translation(*split_text(cat.get('description', '')))
+        # Get Salon Info
+        slug = props.get('locationSlug', '')
+        loc_profile = init_data.get('bookingLocationProfile', {}).get(slug, {}).get('location', {})
+        
+        if loc_profile:
+            salon_name = loc_profile.get('name', 'Salon')
+            st.write(f"**Processing:** {salon_name}")
+            
+            if st.button("🚀 Generate Excel"):
+                with st.spinner("Translating..."):
+                    categories = init_data.get('bookingServices', {}).get('categories', [])
+                    
+                    items_list, highlights = [], []
+                    for cat in categories:
+                        c_en, c_ar, ceh, cah = process_translation(*split_text(cat.get('name', '')))
+                        for item in cat.get('items', []):
+                            i_en, i_ar, ieh, iah = process_translation(*split_text(item.get('name', '')))
+                            id_en, id_ar, ideh, idah = process_translation(*split_text(item.get('description', '')))
                             
-                            for item in cat.get('items', []):
-                                i_en, i_ar, ieh, iah = process_translation(*split_text(item.get('name', '')))
-                                id_en, id_ar, ideh, idah = process_translation(*split_text(item.get('description', '')))
-                                
-                                row_idx = len(items_list) + 2
-                                flags = [ceh, cah, cdeh, cdah, ieh, iah, ideh, idah]
-                                cols = [idx + 1 for idx, flag in enumerate(flags) if flag]
-                                if cols: highlights.append((row_idx, cols))
+                            row_idx = len(items_list) + 2
+                            if any([ceh, cah, ieh, iah, ideh, idah]): 
+                                # Highlight logic
+                                highlights.append((row_idx, [1,2,5,6,7,8]))
 
-                                items_list.append({
-                                    "Cat Name (EN)": c_en, "Cat Name (AR)": c_ar,
-                                    "Cat Desc (EN)": cd_en, "Cat Desc (AR)": cd_ar,
-                                    "Item Name (EN)": i_en, "Item Name (AR)": i_ar,
-                                    "Item Desc (EN)": id_en, "Item Desc (AR)": id_ar,
-                                    "Price": item.get('price', {}).get('formatted', '')
-                                })
+                            items_list.append({
+                                "Cat Name (EN)": c_en, "Cat Name (AR)": c_ar,
+                                "Item Name (EN)": i_en, "Item Name (AR)": i_ar,
+                                "Item Desc (EN)": id_en, "Item Desc (AR)": id_ar,
+                                "Price": item.get('price', {}).get('formatted', '')
+                            })
 
-                        # Excel Memory Buffer
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            df_info.to_excel(writer, sheet_name='INFO', index=False)
-                            pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
-                        
-                        output.seek(0)
-                        wb = load_workbook(output)
-                        ws = wb['ITEMS']
-                        yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-                        for r, cs in highlights:
-                            for c in cs: ws.cell(row=r, column=c).fill = yellow
-                        
-                        final_output = io.BytesIO()
-                        wb.save(final_output)
-                        
-                        st.download_button(
-                            label="📥 Download Excel File",
-                            data=final_output.getvalue(),
-                            file_name=excel_filename,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                    # Excel creation
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
+                    
+                    output.seek(0)
+                    wb = load_workbook(output)
+                    ws = wb['ITEMS']
+                    yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+                    for r, cs in highlights:
+                        for c in cs: ws.cell(row=r, column=c).fill = yellow
+                    
+                    final_output = io.BytesIO()
+                    wb.save(final_output)
+                    st.download_button("📥 Download Excel", data=final_output.getvalue(), file_name=f"{salon_name}.xlsx")
         else:
-            st.warning("⚠️ The JSON structure doesn't look like a Fresha menu. Please check the source.")
+            st.warning("Could not find salon profile in JSON. Ensure you are on a specific salon's page.")
