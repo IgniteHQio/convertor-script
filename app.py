@@ -8,6 +8,7 @@ from deep_translator import GoogleTranslator
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import io
+import time
 
 # --- Configuration ---
 APP_PASSWORD = "Abcd@1234"
@@ -68,102 +69,116 @@ def fetch_salon_json(salon_url):
         build_id = json.loads(next_data_script.string).get('buildId')
         
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        st.info(f"Targeting JSON: {json_url}")
         json_res = requests.get(json_url, headers=headers, timeout=10)
         return json_res.json(), None
     except Exception as e:
         return None, str(e)
 
-def find_key_recursive(data, key_names):
-    if isinstance(data, dict):
-        for kn in key_names:
-            if kn in data: return data[kn]
-        for v in data.values():
-            res = find_key_recursive(v, key_names)
-            if res: return res
-    elif isinstance(data, list):
-        for i in data:
-            res = find_key_recursive(i, key_names)
-            if res: return res
-    return None
-
-# --- UI ---
-
+# --- UI Setup ---
 if check_password():
     st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
     st.title("✂️ SALON JSON to EXCEL")
 
+    # Use session_state to keep the data alive
+    if "raw_data" not in st.session_state:
+        st.session_state["raw_data"] = None
+
     tab1, tab2 = st.tabs(["🔗 Scan URL", "📄 Paste JSON"])
-    raw_json_input = None
 
     with tab1:
-        url_input = st.text_input("Fresha URL:")
+        url_input = st.text_input("Fresha URL:", key="url_box")
         if st.button("Fetch Data"):
-            raw_json_input, err = fetch_salon_json(url_input)
-            if err: st.error(err)
+            with st.spinner("Connecting to Fresha..."):
+                data, err = fetch_salon_json(url_input)
+                if err: st.error(err)
+                else: 
+                    st.session_state["raw_data"] = data
+                    st.success("✅ Data Retrieved Successfully!")
 
     with tab2:
         json_text = st.text_area("Paste JSON content:", height=200)
-        if json_text:
-            try: raw_json_input = json.loads(json_text)
+        if st.button("Load JSON"):
+            try: 
+                st.session_state["raw_data"] = json.loads(json_text)
+                st.success("✅ JSON Loaded!")
             except: st.error("Invalid JSON")
 
-    if raw_json_input:
-        # --- Targeted Search for the Rosoleen Structure ---
-        page_props = raw_json_input.get('pageProps', {})
+    # Processing Section
+    if st.session_state["raw_data"]:
+        data = st.session_state["raw_data"]
+        page_props = data.get('pageProps', {})
         init_data = page_props.get('initialData', {})
-        location_slug = page_props.get('locationSlug', '')
-        
-        # Try finding services in the specific location profile path
-        profile_data = init_data.get('bookingLocationProfile', {}).get(location_slug, {})
+        slug = page_props.get('locationSlug', '')
+        profile_data = init_data.get('bookingLocationProfile', {}).get(slug, {})
         menu_data = profile_data.get('services')
-        
-        # Fallback to general search if path is different
-        if not menu_data:
-            menu_data = find_key_recursive(raw_json_input, ['services', 'categories', 'screenServices'])
-            if isinstance(menu_data, dict) and 'categories' in menu_data:
-                menu_data = menu_data['categories']
-
         salon_name = profile_data.get('location', {}).get('name', 'Salon_Export')
 
         if menu_data:
-            st.success(f"✅ Found {len(menu_data)} service groups!")
-            if st.button("🚀 Generate Excel"):
+            st.info(f"Found {len(menu_data)} service groups for **{salon_name}**")
+            
+            if st.button("🚀 Start Excel Generation"):
                 items_list, highlights = [], []
+                
+                # Flatten items for progress bar
+                all_items = []
                 for group in menu_data:
-                    c_en, c_ar, ceh, cah = process_translation(*split_text(group.get('name', '')))
                     for item in group.get('items', []):
-                        # Extracting specific fields from your link
-                        i_name = item.get('name', '')
-                        i_desc = item.get('description') or item.get('caption') or ""
-                        price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
-                        
-                        i_en, i_ar, ieh, iah = process_translation(*split_text(i_name))
-                        id_en, id_ar, ideh, idah = process_translation(*split_text(i_desc))
-                        
-                        row_idx = len(items_list) + 2
-                        if any([ceh, cah, ieh, iah, ideh, idah]):
-                            highlights.append((row_idx, [1, 2, 3, 4, 5, 6]))
+                        all_items.append((group.get('name', ''), item))
+                
+                total_items = len(all_items)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-                        items_list.append({
-                            "Category (EN)": c_en, "Category (AR)": c_ar,
-                            "Service (EN)": i_en, "Service (AR)": i_ar,
-                            "Desc (EN)": id_en, "Desc (AR)": id_ar,
-                            "Price": price
-                        })
+                for idx, (group_name, item) in enumerate(all_items):
+                    # Update Progress
+                    percent = (idx + 1) / total_items
+                    progress_bar.progress(percent)
+                    status_text.text(f"Processing item {idx+1} of {total_items}...")
 
-                # Excel Logic
+                    c_en, c_ar, ceh, cah = process_translation(*split_text(group_name))
+                    i_name = item.get('name', '')
+                    i_desc = item.get('description') or item.get('caption') or ""
+                    price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
+                    
+                    i_en, i_ar, ieh, iah = process_translation(*split_text(i_name))
+                    id_en, id_ar, ideh, idah = process_translation(*split_text(i_desc))
+                    
+                    row_idx = len(items_list) + 2
+                    if any([ceh, cah, ieh, iah, ideh, idah]):
+                        highlights.append((row_idx, [1, 2, 3, 4, 5, 6]))
+
+                    items_list.append({
+                        "Category (EN)": c_en, "Category (AR)": c_ar,
+                        "Service (EN)": i_en, "Service (AR)": i_ar,
+                        "Desc (EN)": id_en, "Desc (AR)": id_ar,
+                        "Price": price
+                    })
+
+                # Create Excel
+                status_text.text("Finalizing Excel file...")
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     pd.DataFrame(items_list).to_excel(writer, sheet_name='MENU', index=False)
+                
                 output.seek(0)
                 wb = load_workbook(output)
                 ws = wb['MENU']
                 yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
                 for r, cs in highlights:
                     for c in cs: ws.cell(row=r, column=c).fill = yellow
+                
                 final_output = io.BytesIO()
                 wb.save(final_output)
-                st.download_button("📥 Download Excel", final_output.getvalue(), f"{salon_name}.xlsx")
+                
+                st.success("✅ Excel Ready!")
+                st.download_button(
+                    label="📥 Download Translated Excel", 
+                    data=final_output.getvalue(), 
+                    file_name=f"{salon_name}.xlsx"
+                )
         else:
-            st.error("Could not find 'services' or 'categories' in this JSON.")
+            st.error("Data structure not recognized. Ensure you have the full JSON.")
+
+    if st.button("🧹 Clear/Reset"):
+        st.session_state["raw_data"] = None
+        st.rerun()
