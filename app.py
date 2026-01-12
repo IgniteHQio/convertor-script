@@ -11,7 +11,6 @@ import io
 
 # --- Configuration ---
 APP_PASSWORD = "Abcd@1234"
-GRAPHQL_URL = "https://www.fresha.com/graphql"
 
 def check_password():
     if "password_correct" not in st.session_state:
@@ -26,31 +25,6 @@ def check_password():
         else:
             st.error("🚫 Incorrect password")
     return False
-
-def get_employee_services(employee_id, location_slug):
-    """Fetches s:XXXX IDs for a specific employee via GraphQL."""
-    params = {
-        "extensions": json.dumps({
-            "persistedQuery": {
-                "version": 1,
-                "sha256Hash": "d099e71de92492ca928c6f7e5522aeea5328d4cda0b20e34a588558377f23390"
-            }
-        }),
-        "variables": json.dumps({
-            "employeeId": str(employee_id),
-            "locationSlug": location_slug,
-            "includeServices": True
-        })
-    }
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        response = requests.get(GRAPHQL_URL, params=params, headers=headers, timeout=10)
-        data = response.json()
-        categories = data.get('data', {}).get('employeeProfile', {}).get('categories', [])
-        service_ids = [item.get('id') for cat in categories for item in cat.get('items', []) if item.get('id')]
-        return ", ".join(service_ids)
-    except:
-        return ""
 
 def split_text(text):
     if not text: return "", ""
@@ -100,17 +74,25 @@ def fetch_full_salon_data(salon_url):
         base_res = requests.get(salon_url, headers=headers, timeout=10)
         soup = BeautifulSoup(base_res.text, 'html.parser')
         next_data_script = soup.find('script', id='__NEXT_DATA__')
+        if not next_data_script: return None, "Could not find page data script."
+        
         full_page_json = json.loads(next_data_script.string)
         build_id = full_page_json.get('buildId')
-        handle = re.search(r'/a/([^/?#]+)', salon_url).group(1)
+        
+        match = re.search(r'/a/([^/?#]+)', salon_url)
+        if not match: return None, "Invalid URL handle."
+        handle = match.group(1)
+        
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        service_json = requests.get(json_url, headers=headers, timeout=10).json()
-        return {"page_json": full_page_json, "service_json": service_json, "slug": handle}, None
+        json_res = requests.get(json_url, headers=headers, timeout=10)
+        service_json = json_res.json()
+        
+        return {"page_json": full_page_json, "service_json": service_json}, None
     except Exception as e:
         return None, str(e)
 
 if check_password():
-    st.set_page_config(page_title="SALON DATA SCRAPER", page_icon="✂️")
+    st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
     st.title("✂️ SALON DATA SCRAPER")
 
     if "master_data" not in st.session_state:
@@ -122,51 +104,59 @@ if check_password():
         if err: st.error(err)
         else:
             st.session_state["master_data"] = data
-            st.success("✅ Main data fetched!")
+            st.success("✅ Successfully fetched Service and Team data!")
 
     if st.session_state["master_data"]:
         master = st.session_state["master_data"]
+        
         loc_info = find_key_recursive(master['service_json'], 'location') or {}
         menu_data = find_key_recursive(master['service_json'], 'services') or find_key_recursive(master['service_json'], 'categories')
         employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
-        location_slug = master.get('slug')
+        
+        team_rows_raw = []
+        if employee_data and 'edges' in employee_data:
+            for edge in employee_data['edges']:
+                node = edge.get('node', {})
+                team_rows_raw.append(node)
+
+        st.info(f"Salon: **{loc_info.get('name')}** | Menu: {len(menu_data) if menu_data else 0} Groups | Team: {len(team_rows_raw)}")
 
         if st.button("🚀 Generate Final Excel"):
-            # 1. PROCESS TEAM WITH TRANSLATION
-            team_rows = []
-            if employee_data and 'edges' in employee_data:
-                st.write("🔄 Translating Team names and fetching services...")
+            # --- Process Team Data with Translation ---
+            processed_team = []
+            if team_rows_raw:
                 t_prog = st.progress(0)
-                edges = employee_data['edges']
-                for idx, edge in enumerate(edges):
-                    t_prog.progress((idx + 1) / len(edges))
-                    node = edge.get('node', {})
-                    emp_id = node.get('employeeId')
+                for idx, node in enumerate(team_rows_raw):
+                    t_prog.progress((idx + 1) / len(team_rows_raw))
                     
-                    # Split and Translate Name
+                    # Process Name
                     n_en, n_ar, _, _ = process_translation(*split_text(node.get('displayName')))
-                    # Split and Translate Job Title
+                    # Process Job Title
                     j_en, j_ar, _, _ = process_translation(*split_text(node.get('jobTitle')))
-                    # Fetch GraphQL Services
-                    offered_ids = get_employee_services(emp_id, location_slug)
                     
-                    team_rows.append({
-                        "Staff ID": emp_id,
+                    processed_team.append({
+                        "Staff ID": node.get('employeeId'),
                         "Name (EN)": n_en,
                         "Name (AR)": n_ar,
                         "Job Title (EN)": j_en,
                         "Job Title (AR)": j_ar,
-                        "SERVICES OFFERED": offered_ids,
                         "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"
                     })
 
-            # 2. PROCESS ITEMS (SERVICES)
+            # --- Process Service Items ---
             items_list, cell_highlights = [], []
+            info_rows = [
+                {"Field": "Name", "Value": loc_info.get('name')},
+                {"Field": "Description", "Value": loc_info.get('description')},
+                {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
+                {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
+            ]
+
             if menu_data:
                 all_items = [(g.get('name', ''), i) for g in menu_data for i in g.get('items', [])]
-                i_prog = st.progress(0)
+                prog = st.progress(0)
                 for idx, (g_name, item) in enumerate(all_items):
-                    i_prog.progress((idx + 1) / len(all_items))
+                    prog.progress((idx + 1) / len(all_items))
                     c_en, c_ar, ce_t, ca_t = process_translation(*split_text(g_name))
                     i_en, i_ar, ie_t, ia_t = process_translation(*split_text(item.get('name', '')))
                     d_en, d_ar, de_t, da_t = process_translation(*split_text(item.get('description') or ""))
@@ -176,22 +166,32 @@ if check_password():
                     service_id = item.get('id', '')
 
                     row_num = len(items_list) + 2
-                    h = [c for c, t in zip(range(2, 8), [ce_t, ca_t, ie_t, ia_t, de_t, da_t]) if t]
+                    h = []
+                    if ce_t: h.append(2)
+                    if ca_t: h.append(3)
+                    if ie_t: h.append(4)
+                    if ia_t: h.append(5)
+                    if de_t: h.append(6)
+                    if da_t: h.append(7)
                     if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
                         "Service ID": service_id,
-                        "Category (EN)": c_en, "Category (AR)": c_ar,
-                        "Service (EN)": i_en, "Service (AR)": i_ar,
-                        "Desc (EN)": d_en, "Desc (AR)": d_ar,
-                        "Price": price, "DURATION": duration
+                        "Category (EN)": c_en, 
+                        "Category (AR)": c_ar,
+                        "Service (EN)": i_en, 
+                        "Service (AR)": i_ar,
+                        "Desc (EN)": d_en, 
+                        "Desc (AR)": d_ar,
+                        "Price": price, 
+                        "DURATION": duration
                     })
 
-            # 3. EXCEL OUTPUT
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
                 pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
-                pd.DataFrame(team_rows).to_excel(writer, sheet_name='TEAM', index=False)
+                pd.DataFrame(processed_team).to_excel(writer, sheet_name='TEAM', index=False)
 
             output.seek(0)
             wb = load_workbook(output)
@@ -202,7 +202,6 @@ if check_password():
             
             final_out = io.BytesIO()
             wb.save(final_out)
-            st.success("✅ Excel Generated with Staff Translations!")
             st.download_button("📥 Download Final Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
 
     if st.button("🧹 Reset"):
