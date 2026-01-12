@@ -28,11 +28,10 @@ def check_password():
             st.error("🚫 Incorrect password")
     return False
 
-def extract_catalog_id(id_string):
-    """Extracts s:XXXX from the complex stringified ID blob."""
-    if not id_string: return None
-    match = re.search(r's:\d+', str(id_string))
-    return match.group(0) if match else None
+def extract_ids(complex_str):
+    """Extracts all s: and sv: IDs from the messy string."""
+    if not complex_str: return []
+    return re.findall(r'(s:\d+|sv:\d+)', str(complex_str))
 
 def split_text(text):
     if not text: return "", ""
@@ -75,124 +74,108 @@ def fetch_staff_services(slug, emp_id):
     except:
         return []
 
-def find_key_recursive(data, key_name):
-    if isinstance(data, dict):
-        if key_name in data: return data[key_name]
-        for v in data.values():
-            res = find_key_recursive(v, key_name)
-            if res: return res
-    elif isinstance(data, list):
-        for i in data:
-            res = find_key_recursive(i, key_name)
-            if res: return res
-    return None
-
 def fetch_full_salon_data(salon_url):
     try:
         base_res = requests.get(salon_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(base_res.text, 'html.parser')
         next_data_script = soup.find('script', id='__NEXT_DATA__')
-        if not next_data_script: return None, "Could not find page data script."
-        
         full_page_json = json.loads(next_data_script.string)
         build_id = full_page_json.get('buildId')
-        
         match = re.search(r'/a/([^/?#]+)', salon_url)
-        if not match: return None, "Invalid URL handle."
         handle = match.group(1)
-        
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        json_res = requests.get(json_url, headers=HEADERS, timeout=10)
-        service_json = json_res.json()
-        
+        service_json = requests.get(json_url, headers=HEADERS, timeout=10).json()
         return {"page_json": full_page_json, "service_json": service_json, "slug": handle}, None
     except Exception as e:
         return None, str(e)
 
 if check_password():
-    st.set_page_config(page_title="SALON DATA SCRAPER", page_icon="✂️")
-    st.title("✂️ SALON DATA SCRAPER")
-
-    if "master_data" not in st.session_state:
-        st.session_state["master_data"] = None
-
+    st.title("✂️ SALON DATA SCRAPER (FIXED)")
     url_input = st.text_input("Paste Fresha Salon Homepage URL:")
+    
     if st.button("Fetch Salon & Team Data"):
         data, err = fetch_full_salon_data(url_input)
         if err: st.error(err)
         else:
             st.session_state["master_data"] = data
-            st.success("✅ Main data fetched! Ready to map staff.")
+            st.success("✅ Main data fetched!")
 
-    if st.session_state["master_data"]:
+    if "master_data" in st.session_state and st.session_state["master_data"]:
         master = st.session_state["master_data"]
-        loc_info = find_key_recursive(master['service_json'], 'location') or {}
-        menu_data = find_key_recursive(master['service_json'], 'services') or find_key_recursive(master['service_json'], 'categories')
-        employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
         
-        team_rows, emp_ids = [], []
-        if employee_data and 'edges' in employee_data:
-            for edge in employee_data['edges']:
-                node = edge.get('node', {})
-                eid = node.get('employeeId')
-                name = node.get('displayName')
-                if eid:
-                    emp_ids.append((eid, name))
-                    team_rows.append({"Name": name, "Job Title": node.get('jobTitle'), "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"})
-
         if st.button("🚀 Generate Final Excel"):
-            service_id_staff_map = {} 
+            # 1. Gather Team
+            employee_data = master['page_json']['props']['pageProps'].get('location', {}).get('employeeProfiles', {}).get('edges', [])
+            emp_ids = []
+            team_rows = []
+            for edge in employee_data:
+                node = edge['node']
+                emp_ids.append((node['employeeId'], node['displayName']))
+                team_rows.append({
+                    "Name": node['displayName'],
+                    "Job Title": node.get('jobTitle'),
+                    "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else ""
+                })
+
+            # 2. Build Multi-Layer Map
+            id_to_staff = {}   # { ID: [Names] }
+            name_to_staff = {} # { Name: [Names] }
             
-            # Phase 1: Staff Mapping
-            st.write("Extracting qualified staff per service...")
-            staff_prog = st.progress(0)
+            st.write("Extracting staff assignments...")
+            prog = st.progress(0)
             for i, (eid, ename) in enumerate(emp_ids):
-                staff_prog.progress((i + 1) / len(emp_ids))
+                prog.progress((i + 1) / len(emp_ids))
                 categories = fetch_staff_services(master['slug'], eid)
                 for cat in categories:
-                    for s_item in cat.get('items', []):
-                        sid = s_item.get('id') # This is the s:XXXX format
+                    for item in cat.get('items', []):
+                        # Map by ID
+                        sid = item.get('id')
                         if sid:
-                            if sid not in service_id_staff_map:
-                                service_id_staff_map[sid] = []
-                            if ename not in service_id_staff_map[sid]:
-                                service_id_staff_map[sid].append(ename)
+                            id_to_staff.setdefault(sid, []).append(ename)
+                        # Map by Name (Lowercase for fuzzy match)
+                        sname = item.get('name', '').lower().strip()
+                        name_to_staff.setdefault(sname, []).append(ename)
 
-            # Phase 2: Build Items
-            items_list, cell_highlights = [], []
-            if menu_data:
-                all_items = [(g.get('name', ''), i) for g in menu_data for i in g.get('items', [])]
-                item_prog = st.progress(0)
-                for idx, (g_name, item) in enumerate(all_items):
-                    item_prog.progress((idx + 1) / len(all_items))
+            # 3. Process Items
+            items_list, highlights = [], []
+            menu_data = master['service_json']['pageProps'].get('services') or master['service_json']['pageProps'].get('categories') or []
+            
+            for g in menu_data:
+                g_name = g.get('name', '')
+                for item in g.get('items', []):
+                    # Try matching by ID first
+                    found_staff = []
+                    extracted_ids = extract_ids(item.get('id'))
+                    for eid in extracted_ids:
+                        if eid in id_to_staff:
+                            found_staff.extend(id_to_staff[eid])
+                    
+                    # Fallback to Name match if ID failed
+                    if not found_staff:
+                        clean_name = item.get('name', '').lower().strip()
+                        found_staff = name_to_staff.get(clean_name, [])
+                    
+                    # Unique names
+                    found_staff = sorted(list(set(found_staff)))
                     
                     c_en, c_ar, ce_t, ca_t = process_translation(*split_text(g_name))
                     i_en, i_ar, ie_t, ia_t = process_translation(*split_text(item.get('name', '')))
                     d_en, d_ar, de_t, da_t = process_translation(*split_text(item.get('description') or ""))
                     
-                    price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
-                    duration = item.get('caption', '')
-                    
-                    # EXTRACT s:XXXX from the complex main JSON id
-                    complex_id = item.get('id')
-                    extracted_sid = extract_catalog_id(complex_id)
-                    
-                    qualified_staff = service_id_staff_map.get(extracted_sid, [])
-                    staff_str = ", ".join(qualified_staff)
-
                     row_num = len(items_list) + 2
                     h = [idx+1 for idx, val in enumerate([ce_t, ca_t, ie_t, ia_t, de_t, da_t]) if val]
-                    if h: cell_highlights.append((row_num, h))
+                    if h: highlights.append((row_num, h))
 
                     items_list.append({
                         "Category (EN)": c_en, "Category (AR)": c_ar,
                         "Service (EN)": i_en, "Service (AR)": i_ar,
                         "Desc (EN)": d_en, "Desc (AR)": d_ar,
-                        "Price": price, "DURATION": duration,
-                        "QUALIFIED STAFF": staff_str
+                        "Price": item.get('formattedRetailPrice') or "",
+                        "DURATION": item.get('caption', ''),
+                        "QUALIFIED STAFF": ", ".join(found_staff)
                     })
 
-            # Phase 3: Save
+            # 4. Save
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
@@ -202,10 +185,10 @@ if check_password():
             wb = load_workbook(output)
             ws = wb['ITEMS']
             yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-            for r_idx, cols in cell_highlights:
+            for r_idx, cols in highlights:
                 for c_idx in cols: ws.cell(row=r_idx, column=c_idx).fill = yellow
             
             final_out = io.BytesIO()
             wb.save(final_out)
-            st.success("✅ Excel Generated!")
-            st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
+            st.success("✅ Excel Ready!")
+            st.download_button("📥 Download", final_out.getvalue(), "salon_data.xlsx")
