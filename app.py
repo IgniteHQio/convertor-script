@@ -28,8 +28,14 @@ def check_password():
             st.error("🚫 Incorrect password")
     return False
 
-def fetch_employee_service_ids(slug, emp_id):
-    """Calls the GraphQL endpoint to get all service IDs for a specific employee."""
+def clean_id(raw_id):
+    """Extracts 's:12345' from the complex stringified JSON ID."""
+    if not raw_id: return ""
+    match = re.search(r's:\d+', str(raw_id))
+    return match.group(0) if match else str(raw_id)
+
+def fetch_staff_services(slug, emp_id):
+    """Fetches the list of service IDs for a specific employee."""
     params = {
         "extensions": json.dumps({"persistedQuery": {"version": 1, "sha256Hash": "d099e71de92492ca928c6f7e5522aeea5328d4cda0b20e34a588558377f23390"}}),
         "variables": json.dumps({"employeeId": str(emp_id), "locationSlug": slug, "includeServices": True})
@@ -41,12 +47,10 @@ def fetch_employee_service_ids(slug, emp_id):
         ids = []
         for cat in categories:
             for item in cat.get('items', []):
-                # We collect the ID (e.g., s:12345)
-                if item.get('id'):
-                    ids.append(item.get('id'))
-        return ",".join(ids)
+                if item.get('id'): ids.append(item.get('id'))
+        return ", ".join(ids)
     except:
-        return "Error Fetching"
+        return ""
 
 def split_text(text):
     if not text: return "", ""
@@ -96,24 +100,18 @@ def fetch_full_salon_data(salon_url):
         soup = BeautifulSoup(base_res.text, 'html.parser')
         next_data_script = soup.find('script', id='__NEXT_DATA__')
         if not next_data_script: return None, "Could not find page data script."
-        
         full_page_json = json.loads(next_data_script.string)
         build_id = full_page_json.get('buildId')
-        
         match = re.search(r'/a/([^/?#]+)', salon_url)
-        if not match: return None, "Invalid URL handle."
         handle = match.group(1)
-        
         json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        json_res = requests.get(json_url, headers=HEADERS, timeout=10)
-        service_json = json_res.json()
-        
+        service_json = requests.get(json_url, headers=HEADERS, timeout=10).json()
         return {"page_json": full_page_json, "service_json": service_json, "slug": handle}, None
     except Exception as e:
         return None, str(e)
 
 if check_password():
-    st.set_page_config(page_title="SALON DATA SCRAPER", page_icon="✂️")
+    st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
     st.title("✂️ SALON DATA SCRAPER")
 
     if "master_data" not in st.session_state:
@@ -125,7 +123,7 @@ if check_password():
         if err: st.error(err)
         else:
             st.session_state["master_data"] = data
-            st.success("✅ Main data fetched! Now you can generate the Excel.")
+            st.success("✅ Successfully fetched Service and Team data!")
 
     if st.session_state["master_data"]:
         master = st.session_state["master_data"]
@@ -133,26 +131,26 @@ if check_password():
         menu_data = find_key_recursive(master['service_json'], 'services') or find_key_recursive(master['service_json'], 'categories')
         employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
         
+        st.info(f"Salon: **{loc_info.get('name')}** | Menu Groups: {len(menu_data) if menu_data else 0}")
+
         if st.button("🚀 Generate Final Excel"):
-            # 1. Process Team and Fetch Services for each member
+            # 1. Process Team
             team_rows = []
             if employee_data and 'edges' in employee_data:
-                st.write("Fetching services for each team member...")
-                team_prog = st.progress(0)
+                st.write("Fetching services for each staff member...")
+                t_prog = st.progress(0)
                 edges = employee_data['edges']
                 for idx, edge in enumerate(edges):
-                    team_prog.progress((idx + 1) / len(edges))
+                    t_prog.progress((idx + 1) / len(edges))
                     node = edge.get('node', {})
-                    emp_id = node.get('employeeId')
-                    
-                    # Call GraphQL to get the IDs
-                    offered_ids = fetch_employee_service_ids(master['slug'], emp_id)
-                    
+                    eid = node.get('employeeId')
+                    # NEW: Fetching IDs from GraphQL
+                    offered = fetch_staff_services(master['slug'], eid)
                     team_rows.append({
-                        "Staff ID": emp_id,
+                        "Staff ID": eid,
                         "Name": node.get('displayName'),
                         "Job Title": node.get('jobTitle'),
-                        "SERVICES OFFERED": offered_ids,
+                        "SERVICES OFFERED": offered,
                         "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"
                     })
 
@@ -160,19 +158,21 @@ if check_password():
             items_list, cell_highlights = [], []
             if menu_data:
                 all_items = [(g.get('name', ''), i) for g in menu_data for i in g.get('items', [])]
-                item_prog = st.progress(0)
+                prog = st.progress(0)
                 for idx, (g_name, item) in enumerate(all_items):
-                    item_prog.progress((idx + 1) / len(all_items))
+                    prog.progress((idx + 1) / len(all_items))
                     c_en, c_ar, ce_t, ca_t = process_translation(*split_text(g_name))
                     i_en, i_ar, ie_t, ia_t = process_translation(*split_text(item.get('name', '')))
                     d_en, d_ar, de_t, da_t = process_translation(*split_text(item.get('description') or ""))
                     
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
                     duration = item.get('caption', '')
-                    service_id = item.get('id', '')
+                    
+                    # Capture and clean the ID
+                    service_id = clean_id(item.get('id', ''))
 
                     row_num = len(items_list) + 2
-                    h = [idx+2 for idx, val in enumerate([ce_t, ca_t, ie_t, ia_t, de_t, da_t]) if val]
+                    h = [c for c, t in zip(range(2, 8), [ce_t, ca_t, ie_t, ia_t, de_t, da_t]) if t]
                     if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
@@ -183,13 +183,11 @@ if check_password():
                         "Price": price, "DURATION": duration
                     })
 
-            # 3. Create Excel
-            info_rows = [{"Field": "Name", "Value": loc_info.get('name')}]
+            # 3. Build Excel
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
                 pd.DataFrame(team_rows).to_excel(writer, sheet_name='TEAM', index=False)
-                pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
 
             output.seek(0)
             wb = load_workbook(output)
@@ -200,8 +198,8 @@ if check_password():
             
             final_out = io.BytesIO()
             wb.save(final_out)
-            st.success("✅ Excel Generated with Services per Staff!")
-            st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
+            st.success("✅ IDs Linked and Fetched!")
+            st.download_button("📥 Download Final Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
 
     if st.button("🧹 Reset"):
         st.session_state["master_data"] = None
