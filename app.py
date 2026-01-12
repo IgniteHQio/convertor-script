@@ -116,7 +116,7 @@ if check_password():
         if err: st.error(err)
         else:
             st.session_state["master_data"] = data
-            st.success("✅ Main data fetched! Ready to map staff.")
+            st.success("✅ Main data fetched!")
 
     if st.session_state["master_data"]:
         master = st.session_state["master_data"]
@@ -141,21 +141,25 @@ if check_password():
 
         st.info(f"Salon: **{loc_info.get('name')}** | Menu: {len(menu_data) if menu_data else 0} Groups | Team: {len(team_rows)}")
 
-        if st.button("🚀 Generate Final Excel with Staff Mapping"):
-            service_staff_map = {} # {service_name: [staff_names]}
+        if st.button("🚀 Generate Final Excel"):
+            # { "service_id": [staff_names] }
+            service_id_staff_map = {} 
             
-            # Phase 1: Deep Map Staff to Services via GraphQL
-            st.write("Mapping staff members to services...")
+            # Phase 1: Deep Map Staff to Services via GraphQL using IDs
+            st.write("Mapping staff members to service IDs...")
             staff_prog = st.progress(0)
             for i, (eid, ename) in enumerate(emp_ids):
                 staff_prog.progress((i + 1) / len(emp_ids))
                 categories = fetch_staff_services(master['slug'], eid)
                 for cat in categories:
                     for s_item in cat.get('items', []):
-                        s_name = s_item.get('name')
-                        if s_name not in service_staff_map:
-                            service_staff_map[s_name] = []
-                        service_staff_map[s_name].append(ename)
+                        # Use internal service ID (e.g., s:12345)
+                        sid = s_item.get('id')
+                        if sid:
+                            if sid not in service_id_staff_map:
+                                service_id_staff_map[sid] = []
+                            if ename not in service_id_staff_map[sid]:
+                                service_id_staff_map[sid].append(ename)
 
             # Phase 2: Build Item List
             items_list, cell_highlights = [], []
@@ -179,8 +183,9 @@ if check_password():
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
                     duration = item.get('caption', '')
                     
-                    # Get staff names from our mapped dictionary
-                    qualified_staff = service_staff_map.get(item.get('name', ''), [])
+                    # Match by the unique internal Service ID
+                    item_id = item.get('id')
+                    qualified_staff = service_id_staff_map.get(item_id, [])
                     staff_str = ", ".join(qualified_staff)
 
                     row_num = len(items_list) + 2
@@ -190,8 +195,7 @@ if check_password():
                     if ie_t: h.append(3)
                     if ia_t: h.append(4)
                     if de_t: h.append(5)
-                    if da_ar_t if 'da_ar_t' in locals() else da_t: h.append(6) # Safeguard
-                    
+                    if da_t: h.append(6)
                     if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
@@ -202,7 +206,6 @@ if check_password():
                         "QUALIFIED STAFF": staff_str
                     })
 
-            # Phase 3: Save to Excel
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
@@ -219,7 +222,7 @@ if check_password():
             
             final_out = io.BytesIO()
             wb.save(final_out)
-            st.success("✅ Excel Generated with Staff Mapping!")
+            st.success("✅ Excel Generated with ID-Matched Staff!")
             st.download_button("📥 Download Final Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
 
     if st.button("🧹 Reset"):
