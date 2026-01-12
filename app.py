@@ -43,36 +43,18 @@ def split_text(text):
     return en, ar
 
 def process_translation(en_val, ar_val):
-    """Translates missing side and returns (en, ar, was_en_translated, was_ar_translated)"""
-    translated_en = False
-    translated_ar = False
+    t_en, t_ar = False, False
     if ar_val and not en_val:
         try:
             en_val = GoogleTranslator(source='ar', target='en').translate(ar_val)
-            translated_en = True
+            t_en = True
         except: pass
     elif en_val and not ar_val:
         try:
             ar_val = GoogleTranslator(source='en', target='ar').translate(en_val)
-            translated_ar = True
+            t_ar = True
         except: pass
-    return en_val, ar_val, translated_en, translated_ar
-
-def fetch_salon_json(salon_url):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    try:
-        match = re.search(r'/a/([^/?#]+)', salon_url)
-        if not match: return None, "Invalid URL handle."
-        handle = match.group(1)
-        base_res = requests.get(salon_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(base_res.text, 'html.parser')
-        next_data_script = soup.find('script', id='__NEXT_DATA__')
-        build_id = json.loads(next_data_script.string).get('buildId')
-        json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
-        json_res = requests.get(json_url, headers=headers, timeout=10)
-        return json_res.json(), None
-    except Exception as e:
-        return None, str(e)
+    return en_val, ar_val, t_en, t_ar
 
 def find_key_recursive(data, key_name):
     if isinstance(data, dict):
@@ -86,113 +68,125 @@ def find_key_recursive(data, key_name):
             if res: return res
     return None
 
+def fetch_full_salon_data(salon_url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    try:
+        # 1. Fetch HTML to get Team data and Build ID
+        base_res = requests.get(salon_url, headers=headers, timeout=10)
+        soup = BeautifulSoup(base_res.text, 'html.parser')
+        next_data_script = soup.find('script', id='__NEXT_DATA__')
+        if not next_data_script: return None, "Could not find page data script."
+        
+        full_page_json = json.loads(next_data_script.string)
+        build_id = full_page_json.get('buildId')
+        
+        # 2. Extract Handle
+        match = re.search(r'/a/([^/?#]+)', salon_url)
+        if not match: return None, "Invalid URL handle."
+        handle = match.group(1)
+        
+        # 3. Fetch dedicated Service JSON
+        json_url = f"https://www.fresha.com/_next/data/{build_id}/a/{handle}.json"
+        json_res = requests.get(json_url, headers=headers, timeout=10)
+        service_json = json_res.json()
+        
+        return {"page_json": full_page_json, "service_json": service_json}, None
+    except Exception as e:
+        return None, str(e)
+
 if check_password():
     st.set_page_config(page_title="SALON JSON to EXCEL", page_icon="✂️")
-    st.title("✂️ SALON JSON to EXCEL")
+    st.title("✂️ SALON DATA SCRAPER")
 
-    if "raw_data" not in st.session_state:
-        st.session_state["raw_data"] = None
+    if "master_data" not in st.session_state:
+        st.session_state["master_data"] = None
 
-    tab1, tab2 = st.tabs(["🔗 Scan URL", "📄 Paste JSON"])
+    url_input = st.text_input("Paste Fresha Salon Homepage URL:")
+    if st.button("Fetch Salon & Team Data"):
+        data, err = fetch_full_salon_data(url_input)
+        if err: st.error(err)
+        else:
+            st.session_state["master_data"] = data
+            st.success("✅ Successfully fetched Service and Team data!")
 
-    with tab1:
-        url_input = st.text_input("Paste Fresha URL:")
-        if st.button("Fetch Data"):
-            data, err = fetch_salon_json(url_input)
-            if err: st.error(err)
-            else: 
-                st.session_state["raw_data"] = data
-                st.success("✅ Data Retrieved!")
-
-    with tab2:
-        json_text = st.text_area("Paste JSON content:", height=200)
-        if st.button("Load JSON"):
-            try: 
-                st.session_state["raw_data"] = json.loads(json_text)
-                st.success("✅ JSON Loaded!")
-            except: st.error("Invalid JSON")
-
-    if st.session_state["raw_data"]:
-        data = st.session_state["raw_data"]
+    if st.session_state["master_data"]:
+        master = st.session_state["master_data"]
         
-        # 1. INFO DATA EXTRACTION
-        loc_info = find_key_recursive(data, 'location') or {}
-        info_rows = [
-            {"Field": "Name", "Value": loc_info.get('name')},
-            {"Field": "Description", "Value": loc_info.get('description')},
-            {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
-            {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
-        ]
+        # Extract from appropriate JSON sources
+        loc_info = find_key_recursive(master['service_json'], 'location') or {}
+        menu_data = find_key_recursive(master['service_json'], 'services') or find_key_recursive(master['service_json'], 'categories')
         
-        # 2. MENU DATA EXTRACTION
-        menu_data = find_key_recursive(data, 'services') or find_key_recursive(data, 'categories')
+        # Team data usually sits in the page HTML JSON
+        employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
         
-        if menu_data:
-            st.info(f"Salon: **{loc_info.get('name', 'Unknown')}** | Groups: {len(menu_data)}")
-            
-            if st.button("🚀 Generate Excel"):
-                items_list, cell_highlights = [], []
-                
-                # Flatten items
-                all_items = []
-                for group in menu_data:
-                    for item in group.get('items', []):
-                        all_items.append((group.get('name', ''), item))
-                
+        team_rows = []
+        if employee_data and 'edges' in employee_data:
+            for edge in employee_data['edges']:
+                node = edge.get('node', {})
+                team_rows.append({
+                    "Name": node.get('displayName'),
+                    "Job Title": node.get('jobTitle'),
+                    "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"
+                })
+
+        st.info(f"Salon: **{loc_info.get('name')}** | Menu: {len(menu_data) if menu_data else 0} Groups | Team: {len(team_rows)}")
+
+        if st.button("🚀 Generate Final Excel"):
+            items_list, cell_highlights = [], []
+            info_rows = [
+                {"Field": "Name", "Value": loc_info.get('name')},
+                {"Field": "Description", "Value": loc_info.get('description')},
+                {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
+                {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
+            ]
+
+            if menu_data:
+                all_items = [(g.get('name', ''), i) for g in menu_data for i in g.get('items', [])]
                 prog = st.progress(0)
                 for idx, (g_name, item) in enumerate(all_items):
                     prog.progress((idx + 1) / len(all_items))
-                    
-                    # Category
-                    c_en, c_ar, c_en_t, c_ar_t = process_translation(*split_text(g_name))
-                    # Item Name
-                    i_en, i_ar, i_en_t, i_ar_t = process_translation(*split_text(item.get('name', '')))
-                    # Item Desc (Strictly using description field)
-                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or ""))
+                    c_en, c_ar, ce_t, ca_t = process_translation(*split_text(g_name))
+                    i_en, i_ar, ie_t, ia_t = process_translation(*split_text(item.get('name', '')))
+                    d_en, d_ar, de_t, da_t = process_translation(*split_text(item.get('description') or ""))
                     
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
-                    duration = item.get('caption', '')  # Caption used as Duration
-                    
-                    # Track which columns to highlight (1-based index)
+                    duration = item.get('caption', '')
+
                     row_num = len(items_list) + 2
-                    highlights = []
-                    if c_en_t: highlights.append(1)
-                    if c_ar_t: highlights.append(2)
-                    if i_en_t: highlights.append(3)
-                    if i_ar_t: highlights.append(4)
-                    if d_en_t: highlights.append(5)
-                    if d_ar_t: highlights.append(6)
-                    
-                    if highlights:
-                        cell_highlights.append((row_num, highlights))
+                    h = []
+                    if ce_t: h.append(1); 
+                    if ca_t: h.append(2);
+                    if ie_t: h.append(3); 
+                    if ia_t: h.append(4);
+                    if de_t: h.append(5); 
+                    if da_t: h.append(6);
+                    if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
                         "Category (EN)": c_en, "Category (AR)": c_ar,
                         "Service (EN)": i_en, "Service (AR)": i_ar,
                         "Desc (EN)": d_en, "Desc (AR)": d_ar,
-                        "Price": price,
-                        "DURATION": duration
+                        "Price": price, "DURATION": duration
                     })
 
-                # Write Excel
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
-                    pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
-                
-                output.seek(0)
-                wb = load_workbook(output)
-                ws = wb['ITEMS']
-                yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-                
-                # Apply highlight to SPECIFIC cells only
-                for r_idx, cols in cell_highlights:
-                    for c_idx in cols:
-                        ws.cell(row=r_idx, column=c_idx).fill = yellow
-                
-                final_out = io.BytesIO()
-                wb.save(final_out)
-                st.success("✅ Ready!")
-                st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
-        else:
-            st.error("No service menu found in JSON.")
+            # Create Excel
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
+                pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
+                pd.DataFrame(team_rows).to_excel(writer, sheet_name='TEAM', index=False)
+
+            output.seek(0)
+            wb = load_workbook(output)
+            ws = wb['ITEMS']
+            yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+            for r_idx, cols in cell_highlights:
+                for c_idx in cols: ws.cell(row=r_idx, column=c_idx).fill = yellow
+            
+            final_out = io.BytesIO()
+            wb.save(final_out)
+            st.download_button("📥 Download Final Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
+
+    if st.button("🧹 Reset"):
+        st.session_state["master_data"] = None
+        st.rerun()
