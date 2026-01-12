@@ -43,6 +43,7 @@ def split_text(text):
     return en, ar
 
 def process_translation(en_val, ar_val):
+    """Translates missing side and returns (en, ar, was_en_translated, was_ar_translated)"""
     translated_en = False
     translated_ar = False
     if ar_val and not en_val:
@@ -132,6 +133,7 @@ if check_password():
             if st.button("🚀 Generate Excel"):
                 items_list, cell_highlights = [], []
                 
+                # Flatten items
                 all_items = []
                 for group in menu_data:
                     for item in group.get('items', []):
@@ -141,13 +143,16 @@ if check_password():
                 for idx, (g_name, item) in enumerate(all_items):
                     prog.progress((idx + 1) / len(all_items))
                     
+                    # Category
                     c_en, c_ar, c_en_t, c_ar_t = process_translation(*split_text(g_name))
+                    # Item Name
                     i_en, i_ar, i_en_t, i_ar_t = process_translation(*split_text(item.get('name', '')))
-                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or ""))
+                    # Item Desc
+                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or item.get('caption') or ""))
                     
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
-                    duration = item.get('caption', '') # Extracting the time duration
                     
+                    # Track which columns to highlight (1-based index)
                     row_num = len(items_list) + 2
                     highlights = []
                     if c_en_t: highlights.append(1)
@@ -164,10 +169,10 @@ if check_password():
                         "Category (EN)": c_en, "Category (AR)": c_ar,
                         "Service (EN)": i_en, "Service (AR)": i_ar,
                         "Desc (EN)": d_en, "Desc (AR)": d_ar,
-                        "Price": price,
-                        "DURATION": duration
+                        "Price": price
                     })
 
+                # Write Excel
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
@@ -178,6 +183,7 @@ if check_password():
                 ws = wb['ITEMS']
                 yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
                 
+                # Apply highlight to SPECIFIC cells only
                 for r_idx, cols in cell_highlights:
                     for c_idx in cols:
                         ws.cell(row=r_idx, column=c_idx).fill = yellow
@@ -188,7 +194,3 @@ if check_password():
                 st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
         else:
             st.error("No service menu found in JSON.")
-
-    if st.button("🧹 Reset"):
-        st.session_state["raw_data"] = None
-        st.rerun()
