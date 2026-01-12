@@ -93,16 +93,17 @@ if check_password():
 
     url_input = st.text_input("Paste Fresha Salon Homepage URL:")
     if st.button("Fetch All Data"):
-        data, err = fetch_full_salon_data(url_input)
-        if err: st.error(err)
-        else:
-            st.session_state["master_data"] = data
-            st.success("✅ Data Fetched!")
+        with st.spinner("Connecting and extracting..."):
+            data, err = fetch_full_salon_data(url_input)
+            if err: st.error(err)
+            else:
+                st.session_state["master_data"] = data
+                st.success("✅ Data Fetched! Ready to map staff to services.")
 
     if st.session_state["master_data"]:
         master = st.session_state["master_data"]
         
-        # 1. Map Employee IDs to Names
+        # Create a lookup for ID -> Name
         employee_map = {}
         employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
         team_rows = []
@@ -112,7 +113,7 @@ if check_password():
                 eid = node.get('employeeId')
                 name = node.get('displayName')
                 if eid and name:
-                    employee_map[eid] = name
+                    employee_map[str(eid)] = name
                     team_rows.append({
                         "ID": eid, "Name": name, 
                         "Job Title": node.get('jobTitle'), 
@@ -138,25 +139,27 @@ if check_password():
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
                     duration = item.get('caption', '')
 
-                    # --- STAFF MAPPING LOGIC ---
-                    qualified_staff_names = []
-                    # In Fresha JSON, staff are usually linked in variations
-                    variations = item.get('variations') or []
-                    for v in variations:
-                        # Extract employee IDs from the variation
-                        v_staff_ids = v.get('employeeIds') or []
-                        for sid in v_staff_ids:
-                            staff_name = employee_map.get(str(sid))
-                            if staff_name and staff_name not in qualified_staff_names:
-                                qualified_staff_names.append(staff_name)
+                    # --- STAFF MAPPING ---
+                    qualified_staff = set()
+                    # Check variations for employee IDs
+                    vars_list = item.get('variations') or item.get('menuItemVariations') or []
+                    for v in vars_list:
+                        e_ids = v.get('employeeIds') or []
+                        for eid in e_ids:
+                            s_name = employee_map.get(str(eid))
+                            if s_name: qualified_staff.add(s_name)
                     
-                    staff_string = ", ".join(qualified_staff_names)
+                    staff_string = ", ".join(sorted(list(qualified_staff)))
 
+                    # --- HIGHLIGHTING LOGIC (FIXED) ---
                     row_num = len(items_list) + 2
                     h = []
-                    if ce_t: h.append(1); if ca_t: h.append(2)
-                    if ie_t: h.append(3); if ia_t: h.append(4)
-                    if de_t: h.append(5); if da_t: h.append(6)
+                    if ce_t: h.append(1)
+                    if ca_t: h.append(2)
+                    if ie_t: h.append(3)
+                    if ia_t: h.append(4)
+                    if de_t: h.append(5)
+                    if da_t: h.append(6)
                     if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
@@ -167,7 +170,6 @@ if check_password():
                         "QUALIFIED STAFF": staff_string
                     })
 
-                # Excel Output
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     pd.DataFrame(team_rows).to_excel(writer, sheet_name='TEAM', index=False)
