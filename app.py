@@ -28,6 +28,12 @@ def check_password():
             st.error("🚫 Incorrect password")
     return False
 
+def extract_catalog_id(id_string):
+    """Extracts s:XXXX from the complex stringified ID blob."""
+    if not id_string: return None
+    match = re.search(r's:\d+', str(id_string))
+    return match.group(0) if match else None
+
 def split_text(text):
     if not text: return "", ""
     text = str(text).strip()
@@ -116,7 +122,7 @@ if check_password():
         if err: st.error(err)
         else:
             st.session_state["master_data"] = data
-            st.success("✅ Main data fetched!")
+            st.success("✅ Main data fetched! Ready to map staff.")
 
     if st.session_state["master_data"]:
         master = st.session_state["master_data"]
@@ -124,8 +130,7 @@ if check_password():
         menu_data = find_key_recursive(master['service_json'], 'services') or find_key_recursive(master['service_json'], 'categories')
         employee_data = find_key_recursive(master['page_json'], 'employeeProfiles')
         
-        team_rows = []
-        emp_ids = []
+        team_rows, emp_ids = [], []
         if employee_data and 'edges' in employee_data:
             for edge in employee_data['edges']:
                 node = edge.get('node', {})
@@ -133,43 +138,28 @@ if check_password():
                 name = node.get('displayName')
                 if eid:
                     emp_ids.append((eid, name))
-                    team_rows.append({
-                        "Name": name,
-                        "Job Title": node.get('jobTitle'),
-                        "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"
-                    })
-
-        st.info(f"Salon: **{loc_info.get('name')}** | Menu: {len(menu_data) if menu_data else 0} Groups | Team: {len(team_rows)}")
+                    team_rows.append({"Name": name, "Job Title": node.get('jobTitle'), "Avatar URL": node.get('avatar', {}).get('url') if node.get('avatar') else "No Image"})
 
         if st.button("🚀 Generate Final Excel"):
-            # { "service_id": [staff_names] }
             service_id_staff_map = {} 
             
-            # Phase 1: Deep Map Staff to Services via GraphQL using IDs
-            st.write("Mapping staff members to service IDs...")
+            # Phase 1: Staff Mapping
+            st.write("Extracting qualified staff per service...")
             staff_prog = st.progress(0)
             for i, (eid, ename) in enumerate(emp_ids):
                 staff_prog.progress((i + 1) / len(emp_ids))
                 categories = fetch_staff_services(master['slug'], eid)
                 for cat in categories:
                     for s_item in cat.get('items', []):
-                        # Use internal service ID (e.g., s:12345)
-                        sid = s_item.get('id')
+                        sid = s_item.get('id') # This is the s:XXXX format
                         if sid:
                             if sid not in service_id_staff_map:
                                 service_id_staff_map[sid] = []
                             if ename not in service_id_staff_map[sid]:
                                 service_id_staff_map[sid].append(ename)
 
-            # Phase 2: Build Item List
+            # Phase 2: Build Items
             items_list, cell_highlights = [], []
-            info_rows = [
-                {"Field": "Name", "Value": loc_info.get('name')},
-                {"Field": "Description", "Value": loc_info.get('description')},
-                {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
-                {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
-            ]
-
             if menu_data:
                 all_items = [(g.get('name', ''), i) for g in menu_data for i in g.get('items', [])]
                 item_prog = st.progress(0)
@@ -183,19 +173,15 @@ if check_password():
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
                     duration = item.get('caption', '')
                     
-                    # Match by the unique internal Service ID
-                    item_id = item.get('id')
-                    qualified_staff = service_id_staff_map.get(item_id, [])
+                    # EXTRACT s:XXXX from the complex main JSON id
+                    complex_id = item.get('id')
+                    extracted_sid = extract_catalog_id(complex_id)
+                    
+                    qualified_staff = service_id_staff_map.get(extracted_sid, [])
                     staff_str = ", ".join(qualified_staff)
 
                     row_num = len(items_list) + 2
-                    h = []
-                    if ce_t: h.append(1)
-                    if ca_t: h.append(2)
-                    if ie_t: h.append(3)
-                    if ia_t: h.append(4)
-                    if de_t: h.append(5)
-                    if da_t: h.append(6)
+                    h = [idx+1 for idx, val in enumerate([ce_t, ca_t, ie_t, ia_t, de_t, da_t]) if val]
                     if h: cell_highlights.append((row_num, h))
 
                     items_list.append({
@@ -206,25 +192,20 @@ if check_password():
                         "QUALIFIED STAFF": staff_str
                     })
 
+            # Phase 3: Save
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                pd.DataFrame(info_rows).to_excel(writer, sheet_name='INFO', index=False)
                 pd.DataFrame(items_list).to_excel(writer, sheet_name='ITEMS', index=False)
                 pd.DataFrame(team_rows).to_excel(writer, sheet_name='TEAM', index=False)
-
+            
             output.seek(0)
             wb = load_workbook(output)
             ws = wb['ITEMS']
             yellow = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
             for r_idx, cols in cell_highlights:
-                for c_idx in cols:
-                    ws.cell(row=r_idx, column=c_idx).fill = yellow
+                for c_idx in cols: ws.cell(row=r_idx, column=c_idx).fill = yellow
             
             final_out = io.BytesIO()
             wb.save(final_out)
-            st.success("✅ Excel Generated with ID-Matched Staff!")
-            st.download_button("📥 Download Final Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
-
-    if st.button("🧹 Reset"):
-        st.session_state["master_data"] = None
-        st.rerun()
+            st.success("✅ Excel Generated!")
+            st.download_button("📥 Download Excel", final_out.getvalue(), f"{loc_info.get('name','salon')}.xlsx")
