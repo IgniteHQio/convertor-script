@@ -147,10 +147,11 @@ if check_password():
                     c_en, c_ar, c_en_t, c_ar_t = process_translation(*split_text(g_name))
                     # Item Name
                     i_en, i_ar, i_en_t, i_ar_t = process_translation(*split_text(item.get('name', '')))
-                    # Item Desc
-                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or item.get('caption') or ""))
+                    # Item Desc (Strictly using description field)
+                    d_en, d_ar, d_en_t, d_ar_t = process_translation(*split_text(item.get('description') or ""))
                     
                     price = item.get('formattedRetailPrice') or item.get('price', {}).get('formatted', '')
+                    duration = item.get('caption', '')  # Caption used as Duration
                     
                     # Track which columns to highlight (1-based index)
                     row_num = len(items_list) + 2
@@ -169,7 +170,8 @@ if check_password():
                         "Category (EN)": c_en, "Category (AR)": c_ar,
                         "Service (EN)": i_en, "Service (AR)": i_ar,
                         "Desc (EN)": d_en, "Desc (AR)": d_ar,
-                        "Price": price
+                        "Price": price,
+                        "DURATION": duration
                     })
 
                 # Write Excel
