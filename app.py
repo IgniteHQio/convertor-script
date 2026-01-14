@@ -145,8 +145,11 @@ if check_password():
 
             # --- Process Service Items ---
             items_list, cell_highlights = [], []
+            
+            # --- UPDATED: Added Address Field ---
             info_rows = [
                 {"Field": "Name", "Value": loc_info.get('name')},
+                {"Field": "Address", "Value": loc_info.get('address')},
                 {"Field": "Description", "Value": loc_info.get('description')},
                 {"Field": "Contact Number", "Value": loc_info.get('contactNumber')},
                 {"Field": "Cover Image", "Value": loc_info.get('coverImage', {}).get('url')}
